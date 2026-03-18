@@ -38,3 +38,15 @@
 - Sanity check sui valori letti da EEPROM
 - Dashboard: badge "💾 Salvato!" come feedback visivo ad ogni modifica
 - eepromSave() chiamata automaticamente da web, MQTT e joystick (futuro)
+
+## [1.2.0] - 2026-03-18
+
+### Aggiunto
+- Joystick 5-vie per controllo locale completo
+- SU/GIU: modifica targetTemp +/-0.5C, passa a MODE_MANUAL
+- SX: cicla modalita comfort->eco->manual->comfort
+- CENTRALE breve (<1s): toggle sistema ON/OFF
+- CENTRALE lungo (>1s): reset rapido a MODE_COMFORT
+- DX: RST hardware (reboot intenzionale)
+- Debounce 200ms anti-rimbalzo
+- Ogni azione salva in EEPROM e pubblica su MQTT
