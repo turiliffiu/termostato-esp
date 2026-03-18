@@ -75,3 +75,24 @@ Isteresi: 0.5°C | Lettura sensore: ogni 5s | Publish MQTT: ogni 30s
 3. **LED builtin** → GPIO2, active LOW, condiviso con relay
 4. **Batteria ADC** → A0, range 0-1V, usare voltage divider
 5. **MQTT buffer** → impostato a 1024 byte (necessario per discovery)
+
+## Pin Map Joystick (da test hardware 2026-03-18)
+
+| Direzione | Pin Arduino | GPIO | Note                    |
+|-----------|-------------|------|-------------------------|
+| SU        | D6          | 12   | INPUT_PULLUP, LOW=press |
+| GIU       | D7          | 13   | INPUT_PULLUP, LOW=press |
+| SX        | D3          | 0    | INPUT_PULLUP, LOW=press |
+| CENTRALE  | D5          | 14   | INPUT_PULLUP, LOW=press |
+| DX        | RST         | -    | ⚠️ causa reboot, non usare |
+
+## Display OLED
+
+| Parametro | Valore | Note |
+|-----------|--------|------|
+| Driver    | SSD1306 | risponde su I2C |
+| SDA       | D2/GPIO4 | |
+| SCL       | D1/GPIO5 | |
+| Indirizzo | 0x3C | |
+| Risoluzione | 128x32 | init OK con questa |
+| Stato     | ⚠️ pannello fisico guasto | driver OK, pannello morto |
