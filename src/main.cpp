@@ -17,14 +17,14 @@ const char* password = "C1p0ll1na.Rav10la";
 // ========================================
 // CONFIGURAZIONE MQTT
 // ========================================
-const char* mqtt_server = "192.168.1.162";
-const int mqtt_port = 1883;
-const char* mqtt_user = "mqtt_user";
-const char* mqtt_password = "salvo";
+const char* mqtt_server    = "192.168.1.162";
+const int   mqtt_port      = 1883;
+const char* mqtt_user      = "mqtt_user";
+const char* mqtt_password  = "salvo";
 const char* mqtt_client_id = "wemos-termostato";
 const char* mqtt_base_topic = "homeassistant";
-const char* device_name = "Termostato Wemos";
-const char* device_id = "termostato_wemos";
+const char* device_name    = "Termostato Wemos";
+const char* device_id      = "termostato_wemos";
 
 // ========================================
 // CONFIGURAZIONE HARDWARE
@@ -34,16 +34,26 @@ const char* device_id = "termostato_wemos";
 #define AHT_SCL 3
 
 // ========================================
+// JOYSTICK
+// ========================================
+#define JOY_UP        12   // D6
+#define JOY_DOWN      13   // D7
+#define JOY_LEFT       0   // D3
+#define JOY_CENTER    14   // D5
+#define JOY_DEBOUNCE_MS   200
+#define JOY_LONG_PRESS_MS 1000
+
+// ========================================
 // EEPROM
 // ========================================
-#define EEPROM_SIZE     64
-#define EEPROM_MAGIC    0xAB  // cambia se aggiungi campi → forza reset
-#define ADDR_MAGIC      0
-#define ADDR_TARGET     1     // float 4 bytes
-#define ADDR_COMFORT    5     // float 4 bytes
-#define ADDR_ECO        9     // float 4 bytes
-#define ADDR_MODE       13    // byte 1
-#define ADDR_ENABLED    14    // byte 1
+#define EEPROM_SIZE  64
+#define EEPROM_MAGIC 0xAB
+#define ADDR_MAGIC   0
+#define ADDR_TARGET  1
+#define ADDR_COMFORT 5
+#define ADDR_ECO     9
+#define ADDR_MODE    13
+#define ADDR_ENABLED 14
 
 void eepromSave();
 void eepromLoad();
@@ -77,16 +87,21 @@ OperatingMode currentMode = MODE_COMFORT;
 float comfortTemp = 21.0;
 float ecoTemp     = 18.0;
 
-unsigned long lastAHTRead      = 0;
-unsigned long lastMQTTPublish  = 0;
-unsigned long heatingOnTime    = 0;
+unsigned long lastAHTRead       = 0;
+unsigned long lastMQTTPublish   = 0;
+unsigned long heatingOnTime     = 0;
 unsigned long lastHeatingChange = 0;
 
-const unsigned long AHT_READ_INTERVAL   = 5000;
+const unsigned long AHT_READ_INTERVAL    = 5000;
 const unsigned long MQTT_PUBLISH_INTERVAL = 30000;
 
 bool mqttConfigSent = false;
 bool ahtFound       = false;
+
+// Joystick state
+unsigned long joyLastPress   = 0;
+unsigned long joyCenterStart = 0;
+bool          joyCenterHeld  = false;
 
 // ========================================
 // FORWARD DECLARATIONS
@@ -96,54 +111,43 @@ void updateHeating();
 void publishMQTTState();
 void publishMQTTDiscovery();
 void reconnectMQTT();
+void handleJoystick();
 
 // ========================================
 // EEPROM FUNCTIONS
 // ========================================
 void eepromSave() {
     EEPROM.write(ADDR_MAGIC, EEPROM_MAGIC);
-
-    // Scrivi float targetTemp
     EEPROM.put(ADDR_TARGET,  targetTemp);
     EEPROM.put(ADDR_COMFORT, comfortTemp);
     EEPROM.put(ADDR_ECO,     ecoTemp);
-
-    // Scrivi mode e enabled
     EEPROM.write(ADDR_MODE,    (byte)currentMode);
     EEPROM.write(ADDR_ENABLED, systemEnabled ? 1 : 0);
-
     EEPROM.commit();
 }
 
 void eepromLoad() {
     EEPROM.begin(EEPROM_SIZE);
-
     byte magic = EEPROM.read(ADDR_MAGIC);
     if (magic != EEPROM_MAGIC) {
-        // Prima accensione o magic cambiato → usa default e salva
         eepromSave();
         return;
     }
-
     float t, c, e;
     EEPROM.get(ADDR_TARGET,  t);
     EEPROM.get(ADDR_COMFORT, c);
     EEPROM.get(ADDR_ECO,     e);
-
-    // Sanity check valori
     if (t >= 15.0 && t <= 30.0) targetTemp  = t;
     if (c >= 15.0 && c <= 30.0) comfortTemp = c;
     if (e >= 10.0 && e <= 25.0) ecoTemp     = e;
-
     byte mode = EEPROM.read(ADDR_MODE);
     if (mode <= MODE_MANUAL) currentMode = (OperatingMode)mode;
-
     byte en = EEPROM.read(ADDR_ENABLED);
     systemEnabled = (en == 1);
 }
 
 // ========================================
-// HTML DASHBOARD COMPLETA
+// HTML DASHBOARD
 // ========================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -193,7 +197,6 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 </head>
 <body>
 <div class="container">
-
 <div class="card">
 <div class="header-status">
 <div>
@@ -203,33 +206,22 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 <span class="badge" id="heating-badge">Idle</span>
 </div>
 </div>
-
 <div class="card">
 <h3>🌡️ Temperatura Ambiente</h3>
 <div class="temp-display">
 <span class="temp-current" id="current-temp">--</span>
 <span style="font-size:1.5em;color:#6b7280">°C</span>
 </div>
-<div class="sensor-row">
-<span>💧 Umidità:</span>
-<span style="font-weight:600" id="humidity">--</span>
+<div class="sensor-row"><span>💧 Umidità:</span><span style="font-weight:600" id="humidity">--</span></div>
+<div class="sensor-row"><span>📶 WiFi Signal:</span><span style="font-weight:600" id="wifi-rssi">--</span></div>
 </div>
-<div class="sensor-row">
-<span>📶 WiFi Signal:</span>
-<span style="font-weight:600" id="wifi-rssi">--</span>
-</div>
-</div>
-
 <div class="card">
-<h3>🎯 Temperatura Desiderata
-<span class="badge-saved" id="saved-badge">💾 Salvato!</span>
-</h3>
+<h3>🎯 Temperatura Desiderata <span class="badge-saved" id="saved-badge">💾 Salvato!</span></h3>
 <div class="temp-control">
 <button class="temp-btn" onclick="decreaseTemp()">−</button>
 <div class="temp-target" id="target-temp">21.0°C</div>
 <button class="temp-btn" onclick="increaseTemp()">+</button>
 </div>
-
 <h3 style="margin-top:30px">⚙️ Modalità Operativa</h3>
 <div class="mode-selector">
 <button class="mode-btn" id="mode-comfort" onclick="setMode('comfort')">☀️<br>Comfort</button>
@@ -237,48 +229,26 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 <button class="mode-btn" id="mode-manual" onclick="setMode('manual')">🎮<br>Manuale</button>
 </div>
 </div>
-
 <div class="card">
 <h3>🎛️ Stato Sistema</h3>
 <div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0">
 <span style="font-weight:600">Sistema Termostato:</span>
-<div class="toggle-switch active" id="system-toggle" onclick="toggleSystem()">
-<div class="toggle-knob"></div>
-</div>
+<div class="toggle-switch active" id="system-toggle" onclick="toggleSystem()"><div class="toggle-knob"></div></div>
 </div>
 <div class="info-grid">
-<div class="info-box">
-<div class="info-label">🔥 Caldaia</div>
-<div class="info-value" id="heating-state">OFF</div>
-</div>
-<div class="info-box">
-<div class="info-label">⏱️ Tempo ON</div>
-<div class="info-value" id="heating-time">0 min</div>
-</div>
-<div class="info-box">
-<div class="info-label">🌡️ Setpoint</div>
-<div class="info-value">
-<span id="comfort-temp">21</span>°C / <span id="eco-temp">18</span>°C
+<div class="info-box"><div class="info-label">🔥 Caldaia</div><div class="info-value" id="heating-state">OFF</div></div>
+<div class="info-box"><div class="info-label">⏱️ Tempo ON</div><div class="info-value" id="heating-time">0 min</div></div>
+<div class="info-box"><div class="info-label">🌡️ Setpoint</div><div class="info-value"><span id="comfort-temp">21</span>°C / <span id="eco-temp">18</span>°C</div></div>
 </div>
 </div>
-</div>
-</div>
-
 <div class="card">
 <h3>⚡ Azioni</h3>
 <button class="btn btn-primary" onclick="location.href='/update'">⬆️ OTA Firmware Update</button>
 <button class="btn" onclick="restart()">🔄 Riavvia Sistema</button>
 </div>
-
 </div>
-
 <script>
-function showSaved(){
-  const b=document.getElementById('saved-badge');
-  b.style.display='inline-block';
-  setTimeout(()=>b.style.display='none',2000);
-}
-
+function showSaved(){const b=document.getElementById('saved-badge');b.style.display='inline-block';setTimeout(()=>b.style.display='none',2000);}
 function updateData(){
 fetch('/api/status').then(r=>r.json()).then(data=>{
 const t=(data.current_temp!=null&&!isNaN(data.current_temp))?data.current_temp:20.0;
@@ -292,43 +262,27 @@ document.getElementById('wifi-rssi').textContent=rssi+' dBm';
 if(data.ip)document.getElementById('ip-info').textContent='IP: '+data.ip;
 const badge=document.getElementById('heating-badge');
 const state=document.getElementById('heating-state');
-if(data.heating_on){
-badge.textContent='🔥 Riscaldamento';badge.className='badge badge-heating';
-state.textContent='ON';state.style.color='#dc2626';
-}else{
-badge.textContent='❄️ Idle';badge.className='badge badge-idle';
-state.textContent='OFF';state.style.color='#2563eb';
-}
+if(data.heating_on){badge.textContent='🔥 Riscaldamento';badge.className='badge badge-heating';state.textContent='ON';state.style.color='#dc2626';}
+else{badge.textContent='❄️ Idle';badge.className='badge badge-idle';state.textContent='OFF';state.style.color='#2563eb';}
 const minutes=Math.floor((data.heating_time||0)/60);
 document.getElementById('heating-time').textContent=minutes+' min';
 const toggle=document.getElementById('system-toggle');
-if(data.system_enabled)toggle.classList.add('active');
-else toggle.classList.remove('active');
+if(data.system_enabled)toggle.classList.add('active');else toggle.classList.remove('active');
 document.querySelectorAll('.mode-btn').forEach(btn=>btn.classList.remove('active'));
 if(data.mode){const modeBtn=document.getElementById('mode-'+data.mode);if(modeBtn)modeBtn.classList.add('active');}
 if(data.comfort_temp)document.getElementById('comfort-temp').textContent=data.comfort_temp.toFixed(1);
 if(data.eco_temp)document.getElementById('eco-temp').textContent=data.eco_temp.toFixed(1);
 }).catch(err=>console.error('Error:',err));
 }
-
-function increaseTemp(){
-fetch('/api/temp/increase',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
-}
-function decreaseTemp(){
-fetch('/api/temp/decrease',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
-}
-function setMode(mode){
-fetch('/api/mode?value='+mode,{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
-}
-function toggleSystem(){
-fetch('/api/system/toggle',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
-}
+function increaseTemp(){fetch('/api/temp/increase',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));}
+function decreaseTemp(){fetch('/api/temp/decrease',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));}
+function setMode(mode){fetch('/api/mode?value='+mode,{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));}
+function toggleSystem(){fetch('/api/system/toggle',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));}
 function restart(){
 if(confirm('Riavviare il termostato?\n\nDopo il riavvio dovrai ricaricare la pagina.')){
 fetch('/api/restart',{method:'POST'});
 setTimeout(()=>{alert('Riavvio in corso...\nAttendi 10 secondi e ricarica la pagina.');},500);
-}
-}
+}}
 setInterval(updateData,2000);
 updateData();
 </script>
@@ -390,57 +344,87 @@ h1{color:#667eea;margin-bottom:20px}
 let selectedFile=null;
 function fileSelected(){
 selectedFile=document.getElementById('file').files[0];
-if(selectedFile){
-const sizeMB=(selectedFile.size/1024/1024).toFixed(2);
-document.getElementById('file-name').textContent='✅ '+selectedFile.name+' ('+sizeMB+' MB)';
-document.getElementById('upload-btn').disabled=false;
-}
-}
+if(selectedFile){const sizeMB=(selectedFile.size/1024/1024).toFixed(2);document.getElementById('file-name').textContent='✅ '+selectedFile.name+' ('+sizeMB+' MB)';document.getElementById('upload-btn').disabled=false;}}
 document.getElementById('upload-form').onsubmit=async function(e){
-e.preventDefault();
-if(!selectedFile){alert('Seleziona un file!');return;}
-document.getElementById('upload-btn').disabled=true;
-document.getElementById('progress').style.display='block';
-document.getElementById('status').textContent='Upload in corso...';
-const formData=new FormData();
-formData.append('file',selectedFile);
-try{
-const xhr=new XMLHttpRequest();
-xhr.upload.addEventListener('progress',(e)=>{
-if(e.lengthComputable){
-const percent=Math.round((e.loaded/e.total)*100);
-document.getElementById('progress-bar').style.width=percent+'%';
-document.getElementById('progress-bar').textContent=percent+'%';
-}
-});
-xhr.addEventListener('load',()=>{
-if(xhr.status===200){
-document.getElementById('status').innerHTML='✅ Upload completato!<br>Wemos si sta riavviando...<br>Attendi 10 secondi...';
-document.getElementById('status').style.color='#10b981';
-setTimeout(()=>{location.href='/';},10000);
-}else{
-document.getElementById('status').textContent='❌ Errore: '+xhr.statusText;
-document.getElementById('status').style.color='#ef4444';
-document.getElementById('upload-btn').disabled=false;
-}
-});
-xhr.addEventListener('error',()=>{
-document.getElementById('status').textContent='❌ Errore di connessione';
-document.getElementById('status').style.color='#ef4444';
-document.getElementById('upload-btn').disabled=false;
-});
-xhr.open('POST','/update');
-xhr.send(formData);
-}catch(err){
-document.getElementById('status').textContent='❌ Errore: '+err.message;
-document.getElementById('status').style.color='#ef4444';
-document.getElementById('upload-btn').disabled=false;
-}
-};
+e.preventDefault();if(!selectedFile){alert('Seleziona un file!');return;}
+document.getElementById('upload-btn').disabled=true;document.getElementById('progress').style.display='block';document.getElementById('status').textContent='Upload in corso...';
+const formData=new FormData();formData.append('file',selectedFile);
+try{const xhr=new XMLHttpRequest();
+xhr.upload.addEventListener('progress',(e)=>{if(e.lengthComputable){const percent=Math.round((e.loaded/e.total)*100);document.getElementById('progress-bar').style.width=percent+'%';document.getElementById('progress-bar').textContent=percent+'%';}});
+xhr.addEventListener('load',()=>{if(xhr.status===200){document.getElementById('status').innerHTML='✅ Upload completato!<br>Wemos si sta riavviando...<br>Attendi 10 secondi...';document.getElementById('status').style.color='#10b981';setTimeout(()=>{location.href='/';},10000);}else{document.getElementById('status').textContent='❌ Errore: '+xhr.statusText;document.getElementById('status').style.color='#ef4444';document.getElementById('upload-btn').disabled=false;}});
+xhr.addEventListener('error',()=>{document.getElementById('status').textContent='❌ Errore di connessione';document.getElementById('status').style.color='#ef4444';document.getElementById('upload-btn').disabled=false;});
+xhr.open('POST','/update');xhr.send(formData);
+}catch(err){document.getElementById('status').textContent='❌ Errore: '+err.message;document.getElementById('status').style.color='#ef4444';document.getElementById('upload-btn').disabled=false;}};
 </script>
 </body>
 </html>
 )rawliteral";
+
+// ========================================
+// JOYSTICK HANDLER
+// ========================================
+void handleJoystick() {
+    unsigned long now = millis();
+    if (now - joyLastPress < JOY_DEBOUNCE_MS) return;
+
+    // SU: +0.5 gradi
+    if (digitalRead(JOY_UP) == LOW) {
+        joyLastPress = now;
+        targetTemp += 0.5;
+        if (targetTemp > 30.0) targetTemp = 30.0;
+        currentMode = MODE_MANUAL;
+        eepromSave();
+        publishMQTTState();
+        return;
+    }
+
+    // GIU: -0.5 gradi
+    if (digitalRead(JOY_DOWN) == LOW) {
+        joyLastPress = now;
+        targetTemp -= 0.5;
+        if (targetTemp < 15.0) targetTemp = 15.0;
+        currentMode = MODE_MANUAL;
+        eepromSave();
+        publishMQTTState();
+        return;
+    }
+
+    // SX: cicla modalita comfort->eco->manual
+    if (digitalRead(JOY_LEFT) == LOW) {
+        joyLastPress = now;
+        if (currentMode == MODE_COMFORT)     currentMode = MODE_ECO;
+        else if (currentMode == MODE_ECO)    currentMode = MODE_MANUAL;
+        else                                 currentMode = MODE_COMFORT;
+        eepromSave();
+        publishMQTTState();
+        return;
+    }
+
+    // CENTRALE breve = toggle ON/OFF, lungo (>1s) = reset comfort
+    if (digitalRead(JOY_CENTER) == LOW) {
+        if (!joyCenterHeld) {
+            joyCenterHeld  = true;
+            joyCenterStart = now;
+        } else if (now - joyCenterStart >= JOY_LONG_PRESS_MS) {
+            currentMode = MODE_COMFORT;
+            targetTemp  = comfortTemp;
+            eepromSave();
+            publishMQTTState();
+            joyCenterHeld = false;
+            joyLastPress  = now;
+        }
+    } else {
+        if (joyCenterHeld) {
+            if (now - joyCenterStart < JOY_LONG_PRESS_MS) {
+                systemEnabled = !systemEnabled;
+                eepromSave();
+                publishMQTTState();
+            }
+            joyCenterHeld = false;
+            joyLastPress  = now;
+        }
+    }
+}
 
 // ========================================
 // LEGGI AHT
@@ -466,8 +450,8 @@ void updateHeating() {
         if (heatingOn) { digitalWrite(RELAY_PIN, LOW); heatingOn = false; }
         return;
     }
-    if (currentMode == MODE_COMFORT) targetTemp = comfortTemp;
-    else if (currentMode == MODE_ECO) targetTemp = ecoTemp;
+    if (currentMode == MODE_COMFORT)     targetTemp = comfortTemp;
+    else if (currentMode == MODE_ECO)    targetTemp = ecoTemp;
 
     if (!heatingOn) {
         if (currentTemp < (targetTemp - hysteresis)) {
@@ -494,46 +478,46 @@ void publishMQTTDiscovery() {
     auto addDevice = [&]() {
         JsonObject device = doc["device"].to<JsonObject>();
         device["identifiers"][0] = device_id;
-        device["name"] = device_name;
-        device["model"] = "Wemos D1 Mini";
-        device["manufacturer"] = "DIY";
+        device["name"]           = device_name;
+        device["model"]          = "Wemos D1 Mini";
+        device["manufacturer"]   = "DIY";
     };
     doc.clear();
-    doc["name"] = "Temperatura Ambiente";
-    doc["unique_id"] = String(device_id) + "_temp";
-    doc["state_topic"] = String(mqtt_base_topic) + "/sensor/" + device_id + "/temperature/state";
+    doc["name"]               = "Temperatura Ambiente";
+    doc["unique_id"]          = String(device_id) + "_temp";
+    doc["state_topic"]        = String(mqtt_base_topic) + "/sensor/" + device_id + "/temperature/state";
     doc["unit_of_measurement"] = "°C";
-    doc["device_class"] = "temperature";
-    doc["value_template"] = "{{ value_json.temperature }}";
+    doc["device_class"]       = "temperature";
+    doc["value_template"]     = "{{ value_json.temperature }}";
     addDevice();
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/temperature/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
 
     doc.clear();
-    doc["name"] = "Umidità";
-    doc["unique_id"] = String(device_id) + "_humidity";
-    doc["state_topic"] = String(mqtt_base_topic) + "/sensor/" + device_id + "/humidity/state";
+    doc["name"]               = "Umidità";
+    doc["unique_id"]          = String(device_id) + "_humidity";
+    doc["state_topic"]        = String(mqtt_base_topic) + "/sensor/" + device_id + "/humidity/state";
     doc["unit_of_measurement"] = "%";
-    doc["device_class"] = "humidity";
-    doc["value_template"] = "{{ value_json.humidity }}";
+    doc["device_class"]       = "humidity";
+    doc["value_template"]     = "{{ value_json.humidity }}";
     addDevice();
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/humidity/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
 
     doc.clear();
-    doc["name"] = "Termostato";
-    doc["unique_id"] = String(device_id) + "_climate";
-    doc["mode_state_topic"] = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/state";
-    doc["mode_command_topic"] = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
-    doc["temperature_state_topic"] = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/state";
-    doc["temperature_command_topic"] = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
-    doc["current_temperature_topic"] = String(mqtt_base_topic) + "/climate/" + device_id + "/current_temperature/state";
+    doc["name"]                        = "Termostato";
+    doc["unique_id"]                   = String(device_id) + "_climate";
+    doc["mode_state_topic"]            = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/state";
+    doc["mode_command_topic"]          = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
+    doc["temperature_state_topic"]     = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/state";
+    doc["temperature_command_topic"]   = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
+    doc["current_temperature_topic"]   = String(mqtt_base_topic) + "/climate/" + device_id + "/current_temperature/state";
     doc["modes"][0] = "off";
     doc["modes"][1] = "heat";
-    doc["min_temp"] = 15;
-    doc["max_temp"] = 30;
+    doc["min_temp"]  = 15;
+    doc["max_temp"]  = 30;
     doc["temp_step"] = 0.5;
     addDevice();
     serializeJson(doc, payload);
@@ -609,11 +593,16 @@ void reconnectMQTT() {
 void setup() {
     delay(500);
 
-    // Carica impostazioni da EEPROM
     eepromLoad();
 
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);
+
+    // Joystick pin setup
+    pinMode(JOY_UP,     INPUT_PULLUP);
+    pinMode(JOY_DOWN,   INPUT_PULLUP);
+    pinMode(JOY_LEFT,   INPUT_PULLUP);
+    pinMode(JOY_CENTER, INPUT_PULLUP);
 
     ahtWire.begin(AHT_SDA, AHT_SCL);
     if (aht.begin(&ahtWire)) {
@@ -637,15 +626,12 @@ void setup() {
     ArduinoOTA.setPassword("admin");
     ArduinoOTA.begin();
 
-    // Web Server routes
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", index_html);
     });
-
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", update_html);
     });
-
     server.on("/update", HTTP_POST,
         [](AsyncWebServerRequest *request) {
             bool success = !Update.hasError();
@@ -660,26 +646,24 @@ void setup() {
             if (final) Update.end(true);
         }
     );
-
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
         JsonDocument doc;
-        doc["current_temp"]    = currentTemp;
-        doc["humidity"]        = currentHumidity;
-        doc["target_temp"]     = targetTemp;
-        doc["heating_on"]      = heatingOn;
-        doc["system_enabled"]  = systemEnabled;
-        doc["heating_time"]    = heatingOnTime;
-        doc["wifi_rssi"]       = WiFi.RSSI();
-        doc["ip"]              = WiFi.localIP().toString();
-        doc["comfort_temp"]    = comfortTemp;
-        doc["eco_temp"]        = ecoTemp;
+        doc["current_temp"]   = currentTemp;
+        doc["humidity"]       = currentHumidity;
+        doc["target_temp"]    = targetTemp;
+        doc["heating_on"]     = heatingOn;
+        doc["system_enabled"] = systemEnabled;
+        doc["heating_time"]   = heatingOnTime;
+        doc["wifi_rssi"]      = WiFi.RSSI();
+        doc["ip"]             = WiFi.localIP().toString();
+        doc["comfort_temp"]   = comfortTemp;
+        doc["eco_temp"]       = ecoTemp;
         if (currentMode == MODE_COMFORT)     doc["mode"] = "comfort";
         else if (currentMode == MODE_ECO)    doc["mode"] = "eco";
         else                                 doc["mode"] = "manual";
         String response; serializeJson(doc, response);
         request->send(200, "application/json", response);
     });
-
     server.on("/api/temp/increase", HTTP_POST, [](AsyncWebServerRequest *request){
         targetTemp += 0.5;
         if (targetTemp > 30.0) targetTemp = 30.0;
@@ -687,7 +671,6 @@ void setup() {
         eepromSave();
         request->send(200, "text/plain", "OK");
     });
-
     server.on("/api/temp/decrease", HTTP_POST, [](AsyncWebServerRequest *request){
         targetTemp -= 0.5;
         if (targetTemp < 15.0) targetTemp = 15.0;
@@ -695,7 +678,6 @@ void setup() {
         eepromSave();
         request->send(200, "text/plain", "OK");
     });
-
     server.on("/api/mode", HTTP_POST, [](AsyncWebServerRequest *request){
         if (request->hasParam("value")) {
             String mode = request->getParam("value")->value();
@@ -706,18 +688,15 @@ void setup() {
         }
         request->send(200, "text/plain", "OK");
     });
-
     server.on("/api/system/toggle", HTTP_POST, [](AsyncWebServerRequest *request){
         systemEnabled = !systemEnabled;
         eepromSave();
         request->send(200, "text/plain", systemEnabled ? "ON" : "OFF");
     });
-
     server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *request){
         request->send(200, "text/plain", "Restarting...");
         delay(1000); ESP.restart();
     });
-
     server.begin();
 }
 
@@ -736,6 +715,7 @@ void loop() {
     }
     mqttClient.loop();
 
+    handleJoystick();
     readAHT();
     updateHeating();
 
