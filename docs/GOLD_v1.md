@@ -7,7 +7,7 @@
 - **File:** src/main.cpp
 - **Tag git:** v1.0.0-gold
 - **Data:** 2026-02-14
-- **Hash atteso:** da aggiornare dopo primo commit
+- **Hash atteso:** 38023a4
 
 ## Pin Map
 
