@@ -6,6 +6,7 @@
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <EEPROM.h>
 
 // ========================================
 // CONFIGURAZIONE WiFi
@@ -16,7 +17,7 @@ const char* password = "C1p0ll1na.Rav10la";
 // ========================================
 // CONFIGURAZIONE MQTT
 // ========================================
-const char* mqtt_server = "192.168.1.162";  // IP Home Assistant
+const char* mqtt_server = "192.168.1.162";
 const int mqtt_port = 1883;
 const char* mqtt_user = "mqtt_user";
 const char* mqtt_password = "salvo";
@@ -28,15 +29,24 @@ const char* device_id = "termostato_wemos";
 // ========================================
 // CONFIGURAZIONE HARDWARE
 // ========================================
-// Relay
-#define RELAY_PIN D4        // GPIO2
+#define RELAY_PIN D4
+#define AHT_SDA 1
+#define AHT_SCL 3
 
-// Software I2C per AHT10 (usa RX/TX - no conflitti boot)
-#define AHT_SDA 1         // GPIO1 (TX)
-#define AHT_SCL 3          // GPIO3 (RX)
+// ========================================
+// EEPROM
+// ========================================
+#define EEPROM_SIZE     64
+#define EEPROM_MAGIC    0xAB  // cambia se aggiungi campi → forza reset
+#define ADDR_MAGIC      0
+#define ADDR_TARGET     1     // float 4 bytes
+#define ADDR_COMFORT    5     // float 4 bytes
+#define ADDR_ECO        9     // float 4 bytes
+#define ADDR_MODE       13    // byte 1
+#define ADDR_ENABLED    14    // byte 1
 
-// LED integrato per debug visivo
-#define LED_BUILTIN 2       // GPIO2 (condiviso con relay, lampeggia)
+void eepromSave();
+void eepromLoad();
 
 // ========================================
 // SENSORI
@@ -54,39 +64,29 @@ PubSubClient mqttClient(espClient);
 // ========================================
 // VARIABILI TERMOSTATO
 // ========================================
-// Temperatura
-float currentTemp = 20.0;
+float currentTemp     = 20.0;
 float currentHumidity = 50.0;
-float targetTemp = 21.0;
-float hysteresis = 0.5;
+float targetTemp      = 21.0;
+float hysteresis      = 0.5;
+bool  heatingOn       = false;
+bool  systemEnabled   = true;
 
-// Stato
-bool heatingOn = false;
-bool systemEnabled = true;
-
-// Modalità
-enum OperatingMode {
-    MODE_COMFORT,
-    MODE_ECO,
-    MODE_MANUAL
-};
+enum OperatingMode { MODE_COMFORT, MODE_ECO, MODE_MANUAL };
 OperatingMode currentMode = MODE_COMFORT;
 
 float comfortTemp = 21.0;
-float ecoTemp = 18.0;
+float ecoTemp     = 18.0;
 
-// Timing
-unsigned long lastAHTRead = 0;
-unsigned long lastMQTTPublish = 0;
-unsigned long heatingOnTime = 0;
+unsigned long lastAHTRead      = 0;
+unsigned long lastMQTTPublish  = 0;
+unsigned long heatingOnTime    = 0;
 unsigned long lastHeatingChange = 0;
 
-const unsigned long AHT_READ_INTERVAL = 5000;
+const unsigned long AHT_READ_INTERVAL   = 5000;
 const unsigned long MQTT_PUBLISH_INTERVAL = 30000;
 
-// MQTT
 bool mqttConfigSent = false;
-bool ahtFound = false;
+bool ahtFound       = false;
 
 // ========================================
 // FORWARD DECLARATIONS
@@ -96,6 +96,51 @@ void updateHeating();
 void publishMQTTState();
 void publishMQTTDiscovery();
 void reconnectMQTT();
+
+// ========================================
+// EEPROM FUNCTIONS
+// ========================================
+void eepromSave() {
+    EEPROM.write(ADDR_MAGIC, EEPROM_MAGIC);
+
+    // Scrivi float targetTemp
+    EEPROM.put(ADDR_TARGET,  targetTemp);
+    EEPROM.put(ADDR_COMFORT, comfortTemp);
+    EEPROM.put(ADDR_ECO,     ecoTemp);
+
+    // Scrivi mode e enabled
+    EEPROM.write(ADDR_MODE,    (byte)currentMode);
+    EEPROM.write(ADDR_ENABLED, systemEnabled ? 1 : 0);
+
+    EEPROM.commit();
+}
+
+void eepromLoad() {
+    EEPROM.begin(EEPROM_SIZE);
+
+    byte magic = EEPROM.read(ADDR_MAGIC);
+    if (magic != EEPROM_MAGIC) {
+        // Prima accensione o magic cambiato → usa default e salva
+        eepromSave();
+        return;
+    }
+
+    float t, c, e;
+    EEPROM.get(ADDR_TARGET,  t);
+    EEPROM.get(ADDR_COMFORT, c);
+    EEPROM.get(ADDR_ECO,     e);
+
+    // Sanity check valori
+    if (t >= 15.0 && t <= 30.0) targetTemp  = t;
+    if (c >= 15.0 && c <= 30.0) comfortTemp = c;
+    if (e >= 10.0 && e <= 25.0) ecoTemp     = e;
+
+    byte mode = EEPROM.read(ADDR_MODE);
+    if (mode <= MODE_MANUAL) currentMode = (OperatingMode)mode;
+
+    byte en = EEPROM.read(ADDR_ENABLED);
+    systemEnabled = (en == 1);
+}
 
 // ========================================
 // HTML DASHBOARD COMPLETA
@@ -143,12 +188,12 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 .info-box{text-align:center;padding:15px;background:#f9fafb;border-radius:10px}
 .info-label{font-size:0.85em;color:#6b7280;margin-bottom:5px}
 .info-value{font-size:1.3em;font-weight:600;color:#1f2937}
+.badge-saved{background:#d1fae5;color:#065f46;font-size:0.8em;padding:3px 8px;border-radius:6px;display:none}
 </style>
 </head>
 <body>
 <div class="container">
 
-<!-- Header -->
 <div class="card">
 <div class="header-status">
 <div>
@@ -159,7 +204,6 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 </div>
 </div>
 
-<!-- Temperatura Corrente -->
 <div class="card">
 <h3>🌡️ Temperatura Ambiente</h3>
 <div class="temp-display">
@@ -176,9 +220,10 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 </div>
 </div>
 
-<!-- Controllo Temperatura -->
 <div class="card">
-<h3>🎯 Temperatura Desiderata</h3>
+<h3>🎯 Temperatura Desiderata
+<span class="badge-saved" id="saved-badge">💾 Salvato!</span>
+</h3>
 <div class="temp-control">
 <button class="temp-btn" onclick="decreaseTemp()">−</button>
 <div class="temp-target" id="target-temp">21.0°C</div>
@@ -187,19 +232,12 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 
 <h3 style="margin-top:30px">⚙️ Modalità Operativa</h3>
 <div class="mode-selector">
-<button class="mode-btn" id="mode-comfort" onclick="setMode('comfort')">
-☀️<br>Comfort
-</button>
-<button class="mode-btn" id="mode-eco" onclick="setMode('eco')">
-🌙<br>Eco
-</button>
-<button class="mode-btn" id="mode-manual" onclick="setMode('manual')">
-🎮<br>Manuale
-</button>
+<button class="mode-btn" id="mode-comfort" onclick="setMode('comfort')">☀️<br>Comfort</button>
+<button class="mode-btn" id="mode-eco" onclick="setMode('eco')">🌙<br>Eco</button>
+<button class="mode-btn" id="mode-manual" onclick="setMode('manual')">🎮<br>Manuale</button>
 </div>
 </div>
 
-<!-- Stato Sistema -->
 <div class="card">
 <h3>🎛️ Stato Sistema</h3>
 <div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0">
@@ -226,92 +264,71 @@ h3{color:#333;font-size:1.2em;margin-bottom:15px}
 </div>
 </div>
 
-<!-- Azioni -->
 <div class="card">
 <h3>⚡ Azioni</h3>
-<button class="btn btn-primary" onclick="location.href='/update'">
-⬆️ OTA Firmware Update
-</button>
-<button class="btn" onclick="restart()">
-🔄 Riavvia Sistema
-</button>
+<button class="btn btn-primary" onclick="location.href='/update'">⬆️ OTA Firmware Update</button>
+<button class="btn" onclick="restart()">🔄 Riavvia Sistema</button>
 </div>
 
 </div>
 
 <script>
+function showSaved(){
+  const b=document.getElementById('saved-badge');
+  b.style.display='inline-block';
+  setTimeout(()=>b.style.display='none',2000);
+}
+
 function updateData(){
 fetch('/api/status').then(r=>r.json()).then(data=>{
 const t=(data.current_temp!=null&&!isNaN(data.current_temp))?data.current_temp:20.0;
 const h=(data.humidity!=null&&!isNaN(data.humidity))?data.humidity:50.0;
 const tgt=(data.target_temp!=null)?data.target_temp:21.0;
 const rssi=(data.wifi_rssi!=null)?data.wifi_rssi:-50;
-
 document.getElementById('current-temp').textContent=t.toFixed(1);
 document.getElementById('humidity').textContent=h.toFixed(1)+' %';
 document.getElementById('target-temp').textContent=tgt.toFixed(1)+'°C';
 document.getElementById('wifi-rssi').textContent=rssi+' dBm';
-
 if(data.ip)document.getElementById('ip-info').textContent='IP: '+data.ip;
-
 const badge=document.getElementById('heating-badge');
 const state=document.getElementById('heating-state');
 if(data.heating_on){
-badge.textContent='🔥 Riscaldamento';
-badge.className='badge badge-heating';
-state.textContent='ON';
-state.style.color='#dc2626';
+badge.textContent='🔥 Riscaldamento';badge.className='badge badge-heating';
+state.textContent='ON';state.style.color='#dc2626';
 }else{
-badge.textContent='❄️ Idle';
-badge.className='badge badge-idle';
-state.textContent='OFF';
-state.style.color='#2563eb';
+badge.textContent='❄️ Idle';badge.className='badge badge-idle';
+state.textContent='OFF';state.style.color='#2563eb';
 }
-
 const minutes=Math.floor((data.heating_time||0)/60);
 document.getElementById('heating-time').textContent=minutes+' min';
-
 const toggle=document.getElementById('system-toggle');
 if(data.system_enabled)toggle.classList.add('active');
 else toggle.classList.remove('active');
-
 document.querySelectorAll('.mode-btn').forEach(btn=>btn.classList.remove('active'));
-if(data.mode){
-const modeBtn=document.getElementById('mode-'+data.mode);
-if(modeBtn)modeBtn.classList.add('active');
-}
-
+if(data.mode){const modeBtn=document.getElementById('mode-'+data.mode);if(modeBtn)modeBtn.classList.add('active');}
 if(data.comfort_temp)document.getElementById('comfort-temp').textContent=data.comfort_temp.toFixed(1);
 if(data.eco_temp)document.getElementById('eco-temp').textContent=data.eco_temp.toFixed(1);
-
 }).catch(err=>console.error('Error:',err));
 }
 
 function increaseTemp(){
-fetch('/api/temp/increase',{method:'POST'}).then(()=>updateData()).catch(err=>console.error(err));
+fetch('/api/temp/increase',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
 }
-
 function decreaseTemp(){
-fetch('/api/temp/decrease',{method:'POST'}).then(()=>updateData()).catch(err=>console.error(err));
+fetch('/api/temp/decrease',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
 }
-
 function setMode(mode){
-fetch('/api/mode?value='+mode,{method:'POST'}).then(()=>updateData()).catch(err=>console.error(err));
+fetch('/api/mode?value='+mode,{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
 }
-
 function toggleSystem(){
-fetch('/api/system/toggle',{method:'POST'}).then(()=>updateData()).catch(err=>console.error(err));
+fetch('/api/system/toggle',{method:'POST'}).then(()=>{updateData();showSaved();}).catch(err=>console.error(err));
 }
-
 function restart(){
 if(confirm('Riavviare il termostato?\n\nDopo il riavvio dovrai ricaricare la pagina.')){
 fetch('/api/restart',{method:'POST'});
-setTimeout(()=>{
-alert('Riavvio in corso...\nAttendi 10 secondi e ricarica la pagina.');
-},500);
+setTimeout(()=>{alert('Riavvio in corso...\nAttendi 10 secondi e ricarica la pagina.');},500);
 }
 }
-
 setInterval(updateData,2000);
 updateData();
 </script>
@@ -352,14 +369,12 @@ h1{color:#667eea;margin-bottom:20px}
 <div class="container">
 <h1>🔄 OTA Firmware Update</h1>
 <p style="color:#6b7280;margin-bottom:20px">Aggiorna il firmware Wemos</p>
-
 <div class="info">
 <p><strong>📝 Istruzioni:</strong></p>
 <p>1. Compila: <code>pio run</code></p>
 <p>2. File: <code>.pio/build/d1_mini/firmware.bin</code></p>
 <p>3. Seleziona e carica qui sotto</p>
 </div>
-
 <form id="upload-form">
 <div class="file-input" onclick="document.getElementById('file').click()">
 <p id="file-name">📁 Clicca per selezionare firmware.bin</p>
@@ -367,19 +382,12 @@ h1{color:#667eea;margin-bottom:20px}
 </div>
 <button type="submit" class="btn" id="upload-btn" disabled>⬆️ Upload Firmware</button>
 </form>
-
-<div class="progress" id="progress">
-<div class="progress-bar" id="progress-bar">0%</div>
-</div>
-
+<div class="progress" id="progress"><div class="progress-bar" id="progress-bar">0%</div></div>
 <div class="status" id="status"></div>
-
 <button class="btn btn-back" onclick="location.href='/'">← Torna alla Dashboard</button>
 </div>
-
 <script>
 let selectedFile=null;
-
 function fileSelected(){
 selectedFile=document.getElementById('file').files[0];
 if(selectedFile){
@@ -388,21 +396,16 @@ document.getElementById('file-name').textContent='✅ '+selectedFile.name+' ('+s
 document.getElementById('upload-btn').disabled=false;
 }
 }
-
 document.getElementById('upload-form').onsubmit=async function(e){
 e.preventDefault();
 if(!selectedFile){alert('Seleziona un file!');return;}
-
 document.getElementById('upload-btn').disabled=true;
 document.getElementById('progress').style.display='block';
 document.getElementById('status').textContent='Upload in corso...';
-
 const formData=new FormData();
 formData.append('file',selectedFile);
-
 try{
 const xhr=new XMLHttpRequest();
-
 xhr.upload.addEventListener('progress',(e)=>{
 if(e.lengthComputable){
 const percent=Math.round((e.loaded/e.total)*100);
@@ -410,7 +413,6 @@ document.getElementById('progress-bar').style.width=percent+'%';
 document.getElementById('progress-bar').textContent=percent+'%';
 }
 });
-
 xhr.addEventListener('load',()=>{
 if(xhr.status===200){
 document.getElementById('status').innerHTML='✅ Upload completato!<br>Wemos si sta riavviando...<br>Attendi 10 secondi...';
@@ -422,16 +424,13 @@ document.getElementById('status').style.color='#ef4444';
 document.getElementById('upload-btn').disabled=false;
 }
 });
-
 xhr.addEventListener('error',()=>{
 document.getElementById('status').textContent='❌ Errore di connessione';
 document.getElementById('status').style.color='#ef4444';
 document.getElementById('upload-btn').disabled=false;
 });
-
 xhr.open('POST','/update');
 xhr.send(formData);
-
 }catch(err){
 document.getElementById('status').textContent='❌ Errore: '+err.message;
 document.getElementById('status').style.color='#ef4444';
@@ -444,20 +443,17 @@ document.getElementById('upload-btn').disabled=false;
 )rawliteral";
 
 // ========================================
-// LEGGI AHT10/AHT20
+// LEGGI AHT
 // ========================================
 void readAHT() {
     if (!ahtFound) return;
-    
     if (millis() - lastAHTRead >= AHT_READ_INTERVAL) {
         sensors_event_t humidity, temp;
         aht.getEvent(&humidity, &temp);
-        
         if (!isnan(temp.temperature) && !isnan(humidity.relative_humidity)) {
-            currentTemp = temp.temperature;
+            currentTemp     = temp.temperature;
             currentHumidity = humidity.relative_humidity;
         }
-        
         lastAHTRead = millis();
     }
 }
@@ -467,18 +463,12 @@ void readAHT() {
 // ========================================
 void updateHeating() {
     if (!systemEnabled) {
-        if (heatingOn) {
-            digitalWrite(RELAY_PIN, LOW);
-            heatingOn = false;
-        }
+        if (heatingOn) { digitalWrite(RELAY_PIN, LOW); heatingOn = false; }
         return;
     }
-    
-    // Aggiorna target
     if (currentMode == MODE_COMFORT) targetTemp = comfortTemp;
     else if (currentMode == MODE_ECO) targetTemp = ecoTemp;
-    
-    // Logica isteresi
+
     if (!heatingOn) {
         if (currentTemp < (targetTemp - hysteresis)) {
             digitalWrite(RELAY_PIN, HIGH);
@@ -499,10 +489,8 @@ void updateHeating() {
 // ========================================
 void publishMQTTDiscovery() {
     if (mqttConfigSent) return;
-    
     JsonDocument doc;
     String topic, payload;
-    
     auto addDevice = [&]() {
         JsonObject device = doc["device"].to<JsonObject>();
         device["identifiers"][0] = device_id;
@@ -510,8 +498,6 @@ void publishMQTTDiscovery() {
         device["model"] = "Wemos D1 Mini";
         device["manufacturer"] = "DIY";
     };
-    
-    // Temperatura sensor
     doc.clear();
     doc["name"] = "Temperatura Ambiente";
     doc["unique_id"] = String(device_id) + "_temp";
@@ -523,8 +509,7 @@ void publishMQTTDiscovery() {
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/temperature/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    
-    // Umidità sensor
+
     doc.clear();
     doc["name"] = "Umidità";
     doc["unique_id"] = String(device_id) + "_humidity";
@@ -536,8 +521,7 @@ void publishMQTTDiscovery() {
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/humidity/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    
-    // Climate
+
     doc.clear();
     doc["name"] = "Termostato";
     doc["unique_id"] = String(device_id) + "_climate";
@@ -555,7 +539,6 @@ void publishMQTTDiscovery() {
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/climate/" + device_id + "/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    
     mqttConfigSent = true;
 }
 
@@ -564,33 +547,20 @@ void publishMQTTDiscovery() {
 // ========================================
 void publishMQTTState() {
     if (!mqttClient.connected()) return;
-    
     JsonDocument doc;
     String topic, payload;
-    
-    // Temperatura
-    doc.clear();
-    doc["temperature"] = currentTemp;
+    doc.clear(); doc["temperature"] = currentTemp;
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/temperature/state";
     mqttClient.publish(topic.c_str(), payload.c_str());
-    
-    // Umidità
-    doc.clear();
-    doc["humidity"] = currentHumidity;
+    doc.clear(); doc["humidity"] = currentHumidity;
     serializeJson(doc, payload);
     topic = String(mqtt_base_topic) + "/sensor/" + device_id + "/humidity/state";
     mqttClient.publish(topic.c_str(), payload.c_str());
-    
-    // Climate mode
     topic = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/state";
     mqttClient.publish(topic.c_str(), systemEnabled ? "heat" : "off");
-    
-    // Temperature setpoint
     topic = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/state";
     mqttClient.publish(topic.c_str(), String(targetTemp, 1).c_str());
-    
-    // Current temperature
     topic = String(mqtt_base_topic) + "/climate/" + device_id + "/current_temperature/state";
     mqttClient.publish(topic.c_str(), String(currentTemp, 1).c_str());
 }
@@ -600,22 +570,20 @@ void publishMQTTState() {
 // ========================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String message;
-    for (unsigned int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    
-    String modeCommandTopic = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
-    if (String(topic) == modeCommandTopic) {
+    for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+    String modeCmd = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
+    if (String(topic) == modeCmd) {
         systemEnabled = (message == "heat");
+        eepromSave();
         publishMQTTState();
     }
-    
-    String tempCommandTopic = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
-    if (String(topic) == tempCommandTopic) {
+    String tempCmd = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
+    if (String(topic) == tempCmd) {
         targetTemp = message.toFloat();
         if (targetTemp < 15.0) targetTemp = 15.0;
         if (targetTemp > 30.0) targetTemp = 30.0;
         currentMode = MODE_MANUAL;
+        eepromSave();
         publishMQTTState();
     }
 }
@@ -625,13 +593,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // ========================================
 void reconnectMQTT() {
     if (mqttClient.connected()) return;
-    
     if (mqttClient.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
-        String modeCommandTopic = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
-        String tempCommandTopic = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
-        mqttClient.subscribe(modeCommandTopic.c_str());
-        mqttClient.subscribe(tempCommandTopic.c_str());
-        
+        String modeCmd = String(mqtt_base_topic) + "/climate/" + device_id + "/mode/set";
+        String tempCmd = String(mqtt_base_topic) + "/climate/" + device_id + "/temperature/set";
+        mqttClient.subscribe(modeCmd.c_str());
+        mqttClient.subscribe(tempCmd.c_str());
         publishMQTTDiscovery();
         publishMQTTState();
     }
@@ -641,139 +607,117 @@ void reconnectMQTT() {
 // SETUP
 // ========================================
 void setup() {
-    // Serial DISABILITATO per usare D9/D10 come I2C
     delay(500);
-    
-    // GPIO
+
+    // Carica impostazioni da EEPROM
+    eepromLoad();
+
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);
-    
-    // Software I2C per AHT10
+
     ahtWire.begin(AHT_SDA, AHT_SCL);
-    
-    // AHT10/AHT20
     if (aht.begin(&ahtWire)) {
         ahtFound = true;
-        // Prima lettura
         delay(100);
         readAHT();
-    } else {
-        ahtFound = false;
     }
-    
-    // WiFi
+
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
-    
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        attempts++;
+        delay(500); attempts++;
     }
-    
-    // MQTT
+
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setCallback(mqttCallback);
     mqttClient.setBufferSize(1024);
-    
-    // OTA
+
     ArduinoOTA.setHostname("wemos-termostato");
     ArduinoOTA.setPassword("admin");
     ArduinoOTA.begin();
-    
-    // Web Server
+
+    // Web Server routes
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", index_html);
     });
-    
+
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", update_html);
     });
-    
+
     server.on("/update", HTTP_POST,
         [](AsyncWebServerRequest *request) {
             bool success = !Update.hasError();
             AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", success ? "OK" : "FAIL");
             response->addHeader("Connection", "close");
             request->send(response);
-            delay(1000);
-            ESP.restart();
+            delay(1000); ESP.restart();
         },
         [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-            if (!index) {
-                Update.runAsync(true);
-                if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
-                    Update.printError(Serial);
-                }
-            }
-            if (!Update.hasError()) {
-                Update.write(data, len);
-            }
-            if (final) {
-                if (!Update.end(true)) {
-                    Update.printError(Serial);
-                }
-            }
+            if (!index) { Update.runAsync(true); Update.begin((ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000); }
+            if (!Update.hasError()) Update.write(data, len);
+            if (final) Update.end(true);
         }
     );
-    
+
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
         JsonDocument doc;
-        doc["current_temp"] = currentTemp;
-        doc["humidity"] = currentHumidity;
-        doc["target_temp"] = targetTemp;
-        doc["heating_on"] = heatingOn;
-        doc["system_enabled"] = systemEnabled;
-        doc["heating_time"] = heatingOnTime;
-        doc["wifi_rssi"] = WiFi.RSSI();
-        doc["ip"] = WiFi.localIP().toString();
-        doc["comfort_temp"] = comfortTemp;
-        doc["eco_temp"] = ecoTemp;
-        
-        if (currentMode == MODE_COMFORT) doc["mode"] = "comfort";
-        else if (currentMode == MODE_ECO) doc["mode"] = "eco";
-        else doc["mode"] = "manual";
-        
-        String response;
-        serializeJson(doc, response);
+        doc["current_temp"]    = currentTemp;
+        doc["humidity"]        = currentHumidity;
+        doc["target_temp"]     = targetTemp;
+        doc["heating_on"]      = heatingOn;
+        doc["system_enabled"]  = systemEnabled;
+        doc["heating_time"]    = heatingOnTime;
+        doc["wifi_rssi"]       = WiFi.RSSI();
+        doc["ip"]              = WiFi.localIP().toString();
+        doc["comfort_temp"]    = comfortTemp;
+        doc["eco_temp"]        = ecoTemp;
+        if (currentMode == MODE_COMFORT)     doc["mode"] = "comfort";
+        else if (currentMode == MODE_ECO)    doc["mode"] = "eco";
+        else                                 doc["mode"] = "manual";
+        String response; serializeJson(doc, response);
         request->send(200, "application/json", response);
     });
-    
+
     server.on("/api/temp/increase", HTTP_POST, [](AsyncWebServerRequest *request){
         targetTemp += 0.5;
         if (targetTemp > 30.0) targetTemp = 30.0;
         currentMode = MODE_MANUAL;
+        eepromSave();
         request->send(200, "text/plain", "OK");
     });
-    
+
     server.on("/api/temp/decrease", HTTP_POST, [](AsyncWebServerRequest *request){
         targetTemp -= 0.5;
         if (targetTemp < 15.0) targetTemp = 15.0;
         currentMode = MODE_MANUAL;
+        eepromSave();
         request->send(200, "text/plain", "OK");
     });
-    
+
     server.on("/api/mode", HTTP_POST, [](AsyncWebServerRequest *request){
-        if(request->hasParam("value")) {
+        if (request->hasParam("value")) {
             String mode = request->getParam("value")->value();
-            if (mode == "comfort") currentMode = MODE_COMFORT;
-            else if (mode == "eco") currentMode = MODE_ECO;
+            if (mode == "comfort")     currentMode = MODE_COMFORT;
+            else if (mode == "eco")    currentMode = MODE_ECO;
             else if (mode == "manual") currentMode = MODE_MANUAL;
+            eepromSave();
         }
         request->send(200, "text/plain", "OK");
     });
-    
+
     server.on("/api/system/toggle", HTTP_POST, [](AsyncWebServerRequest *request){
         systemEnabled = !systemEnabled;
+        eepromSave();
         request->send(200, "text/plain", systemEnabled ? "ON" : "OFF");
     });
-    
+
     server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *request){
         request->send(200, "text/plain", "Restarting...");
-        delay(1000);
-        ESP.restart();
+        delay(1000); ESP.restart();
     });
-    
+
     server.begin();
 }
 
@@ -782,7 +726,7 @@ void setup() {
 // ========================================
 void loop() {
     ArduinoOTA.handle();
-    
+
     if (!mqttClient.connected()) {
         static unsigned long lastReconnect = 0;
         if (millis() - lastReconnect > 5000) {
@@ -791,14 +735,14 @@ void loop() {
         }
     }
     mqttClient.loop();
-    
+
     readAHT();
     updateHeating();
-    
+
     if (millis() - lastMQTTPublish >= MQTT_PUBLISH_INTERVAL) {
         publishMQTTState();
         lastMQTTPublish = millis();
     }
-    
+
     delay(10);
 }
