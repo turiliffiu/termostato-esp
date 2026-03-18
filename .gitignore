@@ -1,0 +1,30 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python virtualenv
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.bin
+*.elf
+*.hex
+*.map
+
+# Secrets (mai committare!)
+secrets.h
+config_local.h
