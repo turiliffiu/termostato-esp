@@ -29,3 +29,12 @@
 - [ ] Monitoraggio tensione batteria (A0)
 - [ ] Salvataggio setpoint in NVS/EEPROM
 - [ ] Schedulazione oraria (fasce comfort/eco)
+
+## [1.1.0] - 2026-03-18
+
+### Aggiunto
+- EEPROM: salvataggio persistente di targetTemp, comfortTemp, ecoTemp, modalità e stato sistema
+- Magic byte per rilevare prima accensione e forzare valori default
+- Sanity check sui valori letti da EEPROM
+- Dashboard: badge "💾 Salvato!" come feedback visivo ad ogni modifica
+- eepromSave() chiamata automaticamente da web, MQTT e joystick (futuro)
